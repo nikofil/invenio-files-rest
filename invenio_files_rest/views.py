@@ -29,7 +29,7 @@ from __future__ import absolute_import, print_function
 import uuid
 from functools import partial, wraps
 
-from flask import Blueprint, abort, current_app, request
+from flask import Blueprint, abort, current_app, request, session, jsonify
 from flask_login import current_user
 from invenio_db import db
 from invenio_rest import ContentNegotiatedMethodView
@@ -41,7 +41,7 @@ from .models import Bucket, MultipartObject, ObjectVersion, Part
 from .proxies import current_files_rest, current_permission_factory
 from .serializer import json_serializer
 from .signals import file_downloaded
-from .tasks import merge_multipartobject, remove_file_data
+from .tasks import merge_multipartobject, remove_file_data, download_remote
 
 blueprint = Blueprint(
     'invenio_files_rest',
@@ -343,13 +343,37 @@ class ObjectResource(ContentNegotiatedMethodView):
             location='query',
             load_from='uploadId',
             missing=None,
+        ),
+        'remote': fields.Raw(
+            location='query',
+            missing=None
+        ),
+        'remote_id': fields.Raw(
+            location='query',
+            load_from='remoteId',
+            missing=None
         )
     }
 
-    delete_args = get_args
+    delete_args = {
+        'version_id': fields.UUID(
+            location='query',
+            load_from='versionId',
+            missing=None,
+        ),
+        'upload_id': fields.UUID(
+            location='query',
+            load_from='uploadId',
+            missing=None,
+        )
+    }
 
     post_args = {
         'uploads': fields.Raw(
+            location='query',
+            missing=False,
+        ),
+        'remote': fields.Raw(
             location='query',
             missing=False,
         ),
@@ -357,6 +381,11 @@ class ObjectResource(ContentNegotiatedMethodView):
             location='query',
             load_from='uploadId',
             missing=None,
+        ),
+        'remote_url': fields.Raw(
+            location='json',
+            load_from='remoteUrl',
+            missing=None
         )
     }
 
@@ -590,8 +619,20 @@ class ObjectResource(ContentNegotiatedMethodView):
     #
     @use_kwargs(get_args)
     @pass_bucket
-    def get(self, bucket=None, key=None, version_id=None, upload_id=None):
+    def get(self, bucket=None, key=None, version_id=None, upload_id=None,
+            remote=None, remote_id=None):
         """Get object or list parts of a multpart upload."""
+        if remote is not None:
+            task = session['downloads'][remote_id]
+            if task.ready():
+                del session['downloads'][remote_id]
+                if task.failed():
+                    return jsonify(done=True, error=str(task.result))
+                return jsonify(done=True)
+            elif task.state != 'PROGRESS':
+                return jsonify(done=False)
+            else:
+                return jsonify(done=False, **task.info)
         if upload_id:
             return self.multipart_listparts(bucket, key, upload_id)
         else:
@@ -601,8 +642,23 @@ class ObjectResource(ContentNegotiatedMethodView):
     @use_kwargs(post_args)
     @pass_bucket
     @need_bucket_permission('bucket-update')
-    def post(self, bucket=None, key=None, uploads=None, upload_id=None):
+    def post(self, bucket=None, key=None, uploads=None, upload_id=None,
+             remote=False, remote_url=None):
         """Upload a new object or start/complete a multipart upload."""
+        if remote:
+            task = download_remote.delay(
+                remote_url, str(bucket), key,
+                current_app.config['FILES_REST_MULTIPART_CHUNKSIZE_MIN'])
+
+            if 'downloads' not in session:
+                session['downloads'] = dict()
+
+            task_id = str(uuid.uuid4())
+            session['downloads'][task_id] = task
+            session.modified = True
+
+            return jsonify(id=task_id, upload_key=key)
+
         if uploads is not False:
             return self.multipart_init(bucket, key)
         elif upload_id is not None:

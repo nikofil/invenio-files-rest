@@ -28,7 +28,7 @@ from __future__ import absolute_import, print_function
 
 import uuid
 from datetime import datetime
-
+from six import BytesIO
 from celery import current_task, shared_task
 from celery.states import state
 from celery.utils.log import get_task_logger
@@ -36,7 +36,10 @@ from flask import current_app
 from invenio_db import db
 from sqlalchemy.exc import IntegrityError
 
-from .models import FileInstance, Location, MultipartObject, ObjectVersion
+import requests
+
+from .models import FileInstance, Location, MultipartObject, ObjectVersion,\
+    Part
 
 logger = get_task_logger(__name__)
 
@@ -47,6 +50,30 @@ def progress_updater(size, total):
         state=state('PROGRESS'),
         meta=dict(size=size, total=total)
     )
+
+
+@shared_task(bind=True)
+def download_remote(self, url, bucket, key, chunk_size):
+    """Download file from a URL."""
+    response = requests.get(url, stream=True)
+    total = response.headers.get('Content-Length')
+
+    with db.session.begin_nested():
+        if total is None or int(total) < chunk_size:
+            ObjectVersion.create(bucket, key, stream=BytesIO(response.content))
+        else:
+            cur = 0
+            part_cnt = 0
+            total = int(total)
+            mp = MultipartObject.create(bucket, key, total, chunk_size)
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                cur += len(chunk)
+                Part.create(mp, part_cnt, BytesIO(chunk))
+                part_cnt += 1
+                progress_updater(cur, total)
+            mp.complete()
+            mp.merge_parts()
+        db.session.commit()
 
 
 @shared_task(ignore_result=True)

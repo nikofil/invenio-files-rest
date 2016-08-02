@@ -82,6 +82,7 @@ install_requires = [
     'Flask>=0.10',
     'fs>=0.5.4',
     'invenio-rest[cors]>=1.0.0a8',
+    'requests>=2.10.0',
     'SQLAlchemy-Utils>=0.31.0',
     'webargs>=1.1.1',
     'WTForms>=2.0',
